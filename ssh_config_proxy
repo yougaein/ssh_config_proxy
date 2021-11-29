@@ -1,0 +1,882 @@
+#!/usr/bin/env ruby
+
+
+require 'tz/path_aux'
+require 'etc'
+require 'tz/debug2'
+require 'set'
+
+p >> "/root/#{$0.basename}.debug"
+
+DAEMON_PORT = 35423
+
+def eachEnt
+	begin
+		while true
+			ent = Etc.getpwent
+			break if !ent
+			yield ent
+		end
+	ensure
+		Etc.endpwent
+	end
+end
+
+
+def startConfPipeDaemon
+	fork do
+		ds = TCPServer.open("127.0.0.1", DAEMON_PORT)
+		loop do
+			s = ds.accept
+			Process.detach(fork do
+				if s.peeraddr[3] == "127.0.0.1"
+					ppn = s.peeraddr[1]
+					`ss -natup`.each do |ln|
+						ln.split.values_at(4, 6).then do |dest, plist|
+							if dest == "127.0.0.1:#{DAEMON_PORT}"
+								if plist =~ /users:\((.*)\)/
+									while $1 =~ /\((.*?)\)(\,|$)/
+										if $1 =~ /\".*\"\,pid\=(\d+)\,fd\=\d+/ #search sshd 
+											pth = "/tmp/#{$0.basename}-#{$1}"
+											Process.detach(fork do
+												begin
+													(f = pth + ".#{$$}.w").tap(&:mkfifo).open do |r|
+														r.each_line do |ln|
+															s.write ln
+															s.flush
+														end
+													end
+												ensure
+													f.rm_f
+												end
+											end)
+											begin
+												(f = pth + ".#{$$}.r").tap(&:mkfifo).open do |w|
+													s.each_line do |ln|
+														w.write ln
+														w.flush
+													end
+												end
+											ensure
+												f.rm_f
+											end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end)
+		end
+	end
+end
+
+
+class ProcessList
+	Elem = Struct.new(:pid, :ppid, :cmd)
+	def initialize
+		@list = {}
+		`ps axe -eo  pid,ppid,command`.each_line do |ln|
+			pid, ppid, *cmd = ln.strip.split
+			@list[pid] = Elem.new(pid, ppid, cmd)
+		end
+	end
+	def eachParent pe = $$
+		loop do
+			yield pe
+			pe = @list[pe.ppid]
+			break if !pe
+		end 
+	end
+	def select &prc
+		@list.values.select &prc
+	end
+	def self.each_sshd
+		pl = ProcessList.new
+		pl.eachParent do |pe|
+			case pe.cmd[0]
+			when "SCREEN"
+				pl.select do |e|
+					e.cmd[0..2] == ["screen", "-U", "-r"]
+					&& e.cmd[3] =~ /^#{pe.pid}\./
+				end.each do |e|
+					pl.eachParent e do |ex|
+						if ex.cmd[0] == "sshd"
+							yield ex
+							break
+						end
+					end
+				end
+				break
+			when "sshd"
+				yield pe
+				break
+			end
+			pe = plist[pe.ppid]
+		end
+	end
+end
+
+
+def selectConfigPipeAndAgent pid, sockPath = nil
+	client = Struct.new(:agent, :remotePipe, :peer, :startTime)
+	clientList = Hash.new
+	ProcessList.each_sshd do |e|
+		e.cmd.join(" ") =~ /\bSSH_CONNECTION=(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}) (\d{1,5}) /
+		peer = "#{$1}:#{$2}"
+		startTime = "/proc/#{e.pid}/stat".split[21].to_i
+		agent, remotePipe = nil
+		"/tmp/ssh-*/agent.#{e.pid}".glob do |f|
+			agent = f
+			break
+		end
+		"/tmp/ssh_config_proxy-#{e}-*".glob do |f|
+			if f =~ /\.(w|r)$/
+				remotePipeName = $`
+				break
+			end
+		end
+		if agent || remotePipe
+			clientList[peer] = client.new(agent, remotePipe, peer, startTime)
+		end
+	end
+	c = nil
+	if clientList.size > 1
+		tty = "/proc/#{pid}/fd/0".readlink._?{_1 =~ /\/dev\/pts\/\d+/}.&open "rw"
+		if tty
+			begin
+				tty.write "Please select client for ssh-config and/or ssh-agent\n"
+				i = 0
+				clientList.each do |peer, c|
+					i += 1
+					tty.write "(#{i}) #{peer} :#{c.config && ' config'} agent=#{c.agent}.\n"
+				end
+				tty.write "(#{i}) do not use.\n"
+				tty.write "-> "
+				while tty.readline.strip !~ /^\d+$/ || !(1..i).include?($&.to_i)
+					;
+				end
+				c = clienList[$&.to_i - 1]
+			ensure
+				tty.close if tty
+			end
+		else
+			c = clientList.values.sort_by(&:startTime)[-1]
+		end
+	end
+	if sockPath
+		sockPath = sockPath._?{_1[:_r?]&.stat.mode == 0140600}
+		if c
+			if !c.agent && sockPath
+				[c.remotePipe, sockPath, ]
+			else
+				[c, c.agent]
+			end
+		else
+			[nil, sockPath]
+		end #else ssh forwarded
+	else
+		c.remotePipe
+	end
+end
+
+
+def prompt pid, msg
+	"/proc/#{pid}/fd/0".readlink._?{_1 =~ /\/dev\/pts\/\d+/}.&open("rw") do |tty|
+		tty.write msg
+		res = tty.readline
+		if res.strip.downcase =~ /^y(es|)$/
+			return true
+		end
+	end
+	throw :no
+end
+
+
+def getOpeningPid fn
+	`lsof #{fn}|Kgrep -v ruby|grep -v #{$0.basename}|grep -v COMMAND 2>/dev/null`.strip._?[:significant?]&.then do |ln|
+		ln.split[1]&.then do |pid|
+			return pid
+		end
+	end
+end
+
+
+def setAgent
+			envs = "/proc/#{pid}/environ".read.split(/\u0000/)
+			#zshrc.localにssh-agentのdummyパラメータを読み込む。（）
+			sockPath = envs.find{_1 =~ /^SSH_AUTH_SOCK\=/}&.split(/\=/)[1]
+			remotePipe, ag = nil
+			remotePipeName, ag = selectConfigPipeAndAgent pid, sockPath
+			if ag != sockPath
+				if sockPath.symlink?
+					sockPath.unlink
+				else
+					sockPath.mv sockPath + ".org"
+				end
+				ag.symlink sockPath
+			end
+			envs.find{_1 =~ /^(USER|SUDO_USER)/}
+			&.split(/\=/)[1]
+			&.then do |user|
+				begin
+					Etc.getpwnam(user).dir&.then do |d|
+						return d, pid, remotePipeName
+					end
+				ensure
+					Etc.endpwent
+				end
+			end
+end
+
+
+class SSHUserConfig
+	@@fds = []
+	attr_reader :list
+	def self.opath
+		name + ".org"
+	end
+	def self.new fn, hm
+		(@entries ||= Hash.new)[hm] = super(fn, hm)
+	end
+	def self.entries
+		@entries
+	end
+	def paragraphSplit all
+		
+	end
+	def read_config fn
+		all = fn.read
+		pgs = paragraphSplit all
+		pgs.each do |pg|
+			en = pg.to_enum :each_line
+			begin
+				while true
+					item = Item.new
+					while (ln = en.next).strip_comment == ""
+						item.pre += ln
+					end
+					if ln =~ /^\s+/
+						item.pre += $&
+						ln = $'
+					end
+					if ln =~ /\s*(\#.*\s*|)$/
+						item.post += $&
+						ln = $`
+					end
+					item.body = ln.split
+					while (ln = en.next).strip_comment == ""
+						item.post += ln
+					end
+					yield item
+				end
+			rescue StopIteration
+			end
+		end
+	end
+	def getCommandSpec
+		d = "/proc/#{@pid}"
+		((d / "stat").read.split[2] != "Z" rescue nil)&.then do
+			ssh, *args = (d / "cmdline").read.split(/\u0000/)
+			case ssh.basename
+			when "ssh"
+				opts, dest, cmd = {}, nil, []
+				catch :fin do
+					shift = ->{args.shift or throw :fin}
+					while (item = shift[]) =~ /\-([46AaCfGgKkMNnqsTtVvXxYy]*)([BbcDEeFIiJLlmOopQRSWw]|)/
+						$1.chars.each do |e|
+							opts[e] ||= 0
+							opts[e] += 1
+						end
+						if $2 != ""
+							(opts[$2] ||= []).push shift[]
+						end
+					end
+					dest = shift[]
+					if dest =~ /\@/
+						(opts['l'] ||= []).push $`
+						dest = $'
+					end
+				end
+				@dest = dest
+				opts['p'] and @port = opts['p'][-1]
+				opts['l'] and @user = opts['l'][-1]
+				opts['i'] and @identityFile = opts['i'][-1]
+			when "scp"
+				
+			end
+		end
+	end
+	def initialize uid, pid
+		
+		
+		@pid = getOpeningPid(fn) || Process.ppid
+		@home = Etc.getpwuid(uid).dir
+		@uid = uid
+		@fileName = @home / ".ssh" / cls.opath
+		getCommandSpec
+		@list = Hash.new{|h, k| h[k] = self.class.newItem(k)}
+		n = fn.dirname / self.class.name
+		if !n._p?
+			fn = n
+		else
+			@pipeName = n
+		end
+		@fileName = fn
+		Enumerator.new do |y|
+			read_config fn do |cln|
+				y << cln
+			end
+		end
+	end
+
+	def self.fileName uid
+		Etc.getpwuid(uid).dir&.then do |d|
+			return d / ".ssh" / opath
+		end
+	end
+
+	def doMerge
+		before
+		envs = "/proc/#{@pid}/environ".read.split(/\u0000/)
+		envs.each do |ev|
+			if ev =~ /^(USER|SUDO_USER)\=/
+				ent = Etc.getpwnam($'.strip)
+				if ent.uid != @uid
+					merge cls.file(ent.uid), :first
+				end
+				break
+			end
+		end
+		@remotePipeName and readRemote
+		after
+	end
+
+	def merged?
+		@merged != nil
+	end
+	def after pid
+	end
+	def before pid
+	end
+	class KnownHosts < SSHUserConfig
+		def self.name
+			"known_hosts"
+		end
+		def self.newItem k
+			Set.new
+		end
+		def writeBack
+			#bak file
+		
+		end
+		def get knEntryName
+		
+		end
+		def register item, wrBack = false
+			hosts, *pubKey = a = item.body
+			if a.size >= 3
+				keyObj = @list[pubKey]
+				hosts.split(/,/).each do |e|
+					keyObj.add e
+				end
+				keyObj.pre.push item.pre
+				keyObj.post.push item.post
+			else
+				@garbage.push ln.str
+			end
+			writeBack if wrBack
+		end
+		attr_accessor :config
+		def initialize fn, hm, pid = nil
+			super(fn, pid).each do |item|
+				register item
+			end
+			if Config.entries.key?(hm)
+				@config = Config.entries[hm]
+				@config.knownHosts = self
+			end
+		end
+		def merge target
+			@merged = target
+			target.list.each do |pubKey, hosts|
+				hosts.each do |e|
+					@list[pubKey].add e
+				end
+			end
+		end
+		def writeDown fw, pid
+			@list.each do |pubKey, hosts|
+				fw << hosts.to_a.join(",") + " " + pubKey.join(" ").ln
+				#STDERR.write hosts.to_a.join(",") + " " + pubKey.join(" ").ln
+			end
+		end
+		def after pid
+			return if !pid
+			(@threadList ||= {})[pid] ||= Thread.new do
+				catch :fin do
+					loop do
+						p pid
+						"/proc/#{pid}"._?[:_d?]&.then do |pdir|
+							throw :fin if (pdir / "stat").read.split[2] == "Z"
+							a, b, c, d, e, f, g = (pdir / "syscall").read.split
+							p [a, b, c, d, e, f, g]
+							if [a, c, d, e, g] == %W{2 0x441 0x1b6 0x24 0x440}
+								p
+								ln = @pipeName.readline
+								@merged.register ln, true if @merged
+								register ln
+								p
+								throw :fin
+							end
+							true
+						end or throw :fin
+						sleep 1
+					end
+				end
+			end
+		end
+	end
+	class Config < SSHUserConfig
+		class Host
+			def [] propName
+				@propList[propName]
+			end
+			def []= propName, val
+				@propList[propName] = val
+			end
+			attr_reader :name
+			attr_accessor :propList
+			def initialize n
+				@name = n
+				@propList = {}
+			end
+			def writeOn io
+				io << "Host #{@name}".ln
+				@propList.each do |k, v|
+					io << "\t#{k} #{v}".ln
+				end
+				io.flush
+			end
+			
+		end
+		def self.name
+			"config"
+		end
+		def self.newItem k
+			Host.new k
+		end
+		attr_reader :fileName
+		attr_accessor :knownHosts
+
+		def initialize uid, pid = nil
+			fn, hm = super uid, pid
+		end
+
+		def initialize fn, hm, pid = nil
+			super(fn, pid).each do |ln|
+				case ln
+				when /^Host\b/i
+					h = @list[$'.strip]
+				when /^Match\b/i
+					h = @list[ln.strip]
+				when /^IdentityFile\b/i
+					h["identityfile"] = $'.strip.expand_path(fn.dirname)
+				when /^(\w+)\b/
+					h[$1.downcase] ||= $'.strip
+				end
+			end
+			(fn.dirname / "../.ssha")._?[:_d?]&.each_entry do |e|
+		        e.read_each_line do |l|
+		            case l.strip
+		            when /^port\b/i
+		                if $'.strip != ""
+		                	@list[e.basename]["port"] ||= $'.strip
+		                end
+		            when/^user\b/i
+		                if $'.strip != ""
+		                	@list[e.basename]["user"] ||= $'.strip
+			            end
+		            end
+		        end
+			end
+			if KnownHosts.entries.key?(hm)
+				@knownHosts = KnownHosts.entries[hm]
+				@knownHosts.config = self
+			end
+		end
+		def getIdentityFilePath pth = nil
+			if pth
+				if pth =~ /^\~\//
+					@home / $'
+				elsif pth.absolute?
+					pth
+				else
+					@fileName.dirName / pth
+				end
+			else
+				%W{ed25519 ecdsa dsa rsa rsa1}.each do |f|
+					(@fileName.dirname / "id_" + f)._?[:_r?]&.then do |f|
+						return f
+					end
+				end
+			end
+		end
+		def merge outerConf, precedence #login obj
+			@merged = outerConf
+			outerConf.list.each do |hostName, hostObj|
+				if !@list.key?(hostName) || precedence == :first
+					@list[hostName].propList = hostObj.propList.clone
+					@list[hostName].propList["identitiyfile"] ||= hostObj.getIdentityFilePath
+				end
+			end
+		end
+		def match host
+			[host, '*'].each do |h|
+				@list[h]&.then{yield _1}
+			end
+		end
+		def hostName host
+			@list[host]&.['hostname'] || host
+		end
+		def createLocalDaemon # for remote pull down of config/known_hosts
+			pn = nil
+			TCPServer.open("", 0).do |s|
+				pn = Socket.unpack_sockaddr_in(s.getsockname)[0]
+			end
+			s = nil
+			r1, w1 = IO.pipe
+			r2, w2 = IO.pipe
+			fpid = fork do
+				r1.close
+				w2.close
+				TCPSocket.open("127.0.0.1", pn) do |s|
+					Thread.new do
+						s.each_line do |ln|
+							w1.write ln
+							w1.flush
+						end
+					end
+					r2.each_line do |ln|
+						s.write ln
+						s.flush
+					end
+				end
+			end
+			w1.close
+			r2.close
+			r1.__defun__ :processIt do
+				ln = nil
+				begin
+					ln = r1.getline
+				rescue EOFError, Errno::EPIPE, Errno::EIO
+					@@fds.delete r1
+					Process.kill(:TERM, fpid) rescue nil
+					Thread.new do
+						Process.wait(fpid) rescue nil
+					end
+				else
+					case ln.strip
+					when /^GET\s+config\b/i
+						match($'.strip) do |host|
+							host.writeOn s
+							w2.flush
+						end
+					when /^GET\s+known_hosts\b/i
+						w2.write (@knownHosts&.get(hostName($'.strip)) || "").ln
+					when /^POST\s+known_hosts\b/i
+						@knownHosts&.register r1.readline, true
+					end
+				end
+			end
+			@localConfigPort = pn
+			@@fds.push r1
+		end
+		def readRemote remotePipeName
+			(remotePipeName + ".w").writelnF "GET config #{@dest}"
+			(remotePipeName + ".r").read
+		end
+		def writeDown fw
+			@list.each_value do |host|
+				fw << "Host #{host.name}\n";
+				host.propList.each do |k ,v|
+					if v
+						fw << "\t#{k} #{v}\n"
+					end
+				end
+			end
+			fw << "Host *\n"
+			   << "	ExitOnForwardFailure yes\n"
+			   << " RemoteForward #{@localConfigPort}:127.0.0.1:#{DAEMON_PORT}\n"
+			   << " PermitLocalCommand yes\n"
+			   << " LocalCommand #{__FILE__} local\n"
+			fw.flush
+		end
+		def after pid
+			createLocalDaemon
+		end
+		def before pid
+			if @merged
+				@merged.before pid
+			else
+				if @dest
+					pres = nil
+					hobj = nil
+					renewed = false
+					catch :no do
+						%W{user port identityFile}.each do |item|
+							it = instance_variable_get('@' + item)
+							if it
+								if hobj ||= (@list.key?(dest) && @list[dest])
+									if it != (jt = hobj.propList[item.capitalize])
+										if pres ||= prompt(pid, "new #{item.capitalize}, '#{it}' (original: '#{jt}') is specified, replace config entry <Y/N>?") #may throw :no
+											hobj.propList[item.capitalize] = it
+											renewed = true
+										end
+									end
+								else #new dest
+									if pres ||= prompt(pid, "new destination #{dest} with non-default parameter is specified. create new config entry <Y/N>?") #may throw :no
+										hobj = @list[dest]
+										hobj.propList[item.capitalize] = it
+										renewed = true
+									end
+								end
+							end
+						end
+					end
+					writeBack if renewed
+				end
+			end
+		end
+	end
+	
+	def self.start
+		i = 0
+		fds = []
+		eachEnt do |ent|
+			i += 1
+			if ent.shell =~ /\/(screen_login|zsh)/
+				if (d = ent.dir) =~ /^\/(home\/|root$)/
+					[KnownHosts, Config].each do |cls|
+						cls.emerge ent.uid
+					end
+					(d / ".ssh").check_dir.then do |ds|
+						if ds.stat.mode != 0700
+							ds.chmod 0700
+						end
+						if ds.stat.uid != ent.uid || ds.stat.gid != ent.gid
+							ds.chown ent.uid, ent.gid
+						end
+						crPipe = ->cls{
+							pr, pw = IO.pipe
+							nr, nw = IO.pipe
+							f = ds / cls.name
+							forg = ds / cls.opath
+							fork do
+								pw.close
+								nr.close
+								Process.egid = ent.gid
+								Process.euid = ent.uid
+								f._r? || f.touch
+								if !f._p?
+									f.mv forg
+								end
+								at_exit do
+									if !forking
+										p.red $!
+										p.red f
+										if f._p?
+											f.rm_f
+										end
+										forg.mv f
+									end
+								end
+								p
+								if !f._p?
+									p
+									f.mkfifo
+									p
+								end
+								p
+								obj, pid = nil
+								loop do
+									begin
+										f.open "wl" do |fw|
+											nw.write "\n"
+											pr.each_line do |ln|
+												if ln.chomp =~ /__END__$/
+													break
+												end
+												fw.write ln
+											end
+										end
+									rescue Errno::EPIPE
+									end
+								end
+							end
+							pr.close
+							nw.close
+							writer = ->{
+								pw.write "\n"
+								pw.flush
+								hm, pid, remotePipeName = getLogonDirPidAndSetAgent(f)
+								obj = cls.new forg, ent.dir
+								p.cyan hm, pid
+								obj.before pid
+								if ent.uid == 0
+									if hm != ent.dir
+										lobj = cls.new hm / ".ssh" / cls.opath, hm, pid
+										obj.merge lobj, :first
+									end
+								end
+								if remotePipeName
+									obj.readRemote remotePipeName #read from remote daemon
+								end
+								p
+								obj.writeDown pw, pid 
+								pw.write "__END__\n"
+								pw.flush
+								obj.after pid #createLocalDaemon
+								p
+								p
+							}
+							nr.__defun__ :processIt, &writer
+							nr
+						}
+						if ent.uid == 0
+							@@fds.push crPipe[KnownHosts]
+						end
+						@@fds.push crPipe[Config]
+					end
+				end
+			end
+		end
+		loop do
+			rds = IO.select @@fds
+			rds&.each do |r|
+				cmd = r.readline
+				r.processIt cmd
+			end
+		end
+	end
+	def self.startLocalCommand
+		ppid = Process.ppid
+		Etc.getpwuid.dir&.then do |d|
+			conf = Config.new d / ".ssh" / Config.opath, d, ppid # ssh pid
+			envs = "/proc/#{pid}/environ".read.split(/\u0000/)
+			envs.each do |ev|
+				if ev =~ /^(USER|SUDO_USER)\=/
+					ent = Etc.getpwnam($'.strip)
+					if ent.uid != Process.uid && (d = ent.dir)
+						conf.merge Config.new(d / ".ssh" / Config.opath, d, ppid)
+					end
+					break
+				end
+			end
+			selectConfigPipeAndAgent(ppid)&.then do |confPipe|
+				conf.readRemote confPipe
+			end
+		end
+			if @merged
+				@merged.before pid
+			else
+				if @dest
+					pres = nil
+					hobj = nil
+					renewed = false
+					catch :no do
+						%W{user port identityFile}.each do |item|
+							it = instance_variable_get('@' + item)
+							if it
+								if hobj ||= (@list.key?(dest) && @list[dest])
+									if it != (jt = hobj.propList[item.capitalize])
+										if pres ||= prompt(pid, "new #{item.capitalize}, '#{it}' (original: '#{jt}') is specified, replace config entry <Y/N>?") #may throw :no
+											hobj.propList[item.capitalize] = it
+											renewed = true
+										end
+									end
+								else #new dest
+									if pres ||= prompt(pid, "new destination #{dest} with non-default parameter is specified. create new config entry <Y/N>?") #may throw :no
+										hobj = @list[dest]
+										hobj.propList[item.capitalize] = it
+										renewed = true
+									end
+								end
+							end
+						end
+					end
+					writeBack if renewed
+				end
+			end
+	end
+end
+
+
+if ARGV.empty?
+	SSHUserConfig.start
+else
+	SSHUserConfig.startLocalCommand
+end
+startConfPipeDaemon
+Process.waitall
+
+exit 0
+
+
+Pipe = ARGV[0]
+
+if !Pipe.pipe?
+	die "#{Pipe} is not a fifo.\nPlease create a fifo by mkfifo."
+end
+
+
+Pipe.open "w" do |fw|
+	fw.write "\n"
+	`lsof #{Pipe}|grep ssh`.strip._?[:significant?]&.then do |ln|
+		ln.split[1]&.then do |pid|
+			"/proc/#{pid}/environ".read
+			.split(/\u0000/)
+			.find{_1 =~ /^(USER|SUDO_USER)/}
+			&.split(/\=/)[1]
+			&.then do |user|
+				Etc.getpwnam(user).dir&.then do |d|
+				    (d / ".ssha")._?[:_d?]&.each_entry do |e|
+				        port, user = nil
+				        e.read_each_line do |l|
+				            case l.strip
+				            when /^port\b/i
+				                if $'.strip != ""
+				                    port = $'.strip.to_i
+				                end
+				            when/^user\b/i
+				                if $'.strip != ""
+					                user = $'.strip
+					            end
+				            end
+				        end
+				        if port || user
+				        	print "Host #{e.basename}\n"
+				            fw.write "Host #{e.basename}\n"
+				            if port
+					        	print "\tPort #{port}\n"
+				                fw.write "\tPort #{port}\n"
+				            end
+				            if user
+				                print "\tUser #{user}\n"
+				                fw.write "\tUser #{user}\n"
+				            end
+				            print "\tIdentityFile #{d}/.ssh/id_ed25519\n"
+				            fw.write "\tIdentityFile #{d}/.ssh/id_ed25519\n"
+				        end
+				    end
+					(d / ".ssh/config")._?[:_r?]&.read.then do |c|
+						fw.write "\n\n" + c
+					end
+				end
+			end
+		end
+	end
+end
+
+# fw << "\n\n" + (d / ".ssh/config"){?_r?}.read
